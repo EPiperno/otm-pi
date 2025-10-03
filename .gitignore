@@ -1,0 +1,1 @@
+# Python\n__pycache__/\n*.py[cod]\n*.pyo\n*.pyd\n*.so\n\n# Virtual environments\notm_venv/\n.env/\n.venv/\n\n# Build / distribution\nbuild/\ndist/\n*.egg-info/\n\n# IDE/editor\n.vscode/\n.idea/\n*.swp\n\n# Logs / temp\n*.log\n.cache/\n.tmp/
