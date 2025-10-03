@@ -22,17 +22,20 @@ current_limit_amps = 1.3
 voltage = 5.0
 
 [camera]
+# Set to 'opencv' for generic USB/UVC camera; 'daheng' for industrial camera via gxipy.
 backend = daheng
 index = 1        # 1-based; change if you have multiple cameras
 resolution = 640X480
 fps = 30
-serial =               # Optional Daheng camera serial overrides index if set
+serial =               # Optional Daheng camera serial overrides index if set (daheng only)
 jpeg_quality = 40       # 40-95; lower = faster/smaller
-downscale = 1          # Integer factor to shrink frames (2 halves width/height)
-frame_skip = 0          # Skip N frames between sends (0 = none)
-roi =                   # Optional ROI x,y,w,h (e.g. 200,150,800,600)
-exposure_us =           # Initial exposure in microseconds (Daheng); if using OpenCV backend convert logic applies
-gain_db =               # Initial gain in dB
+downscale = 1          # (future) Integer factor to shrink frames (2 halves width/height)
+frame_skip = 0          # (future) Skip N frames between sends (0 = none)
+roi =                   # (future) ROI x,y,w,h (e.g. 200,150,800,600)
+exposure_us =           # Initial exposure in microseconds (Daheng); ignored by OpenCV if unsupported
+gain_db =               # Initial gain in dB (best-effort for OpenCV)
 flip_mode = v        # none|h|v|hv (flip horizontally, vertically, or both)
-no_buffer = 1        # already there if you enabled it
-flush_reads = 0      # try 1–4; higher costs more CPU but lowers latency
+no_buffer = 1        # (future) no-buffer mode
+flush_reads = 0      # (future) try 1–4; higher costs more CPU but lowers latency
+safe_mode = 1        # For Daheng: set 1 to skip width/height/fps configuration if crashes occur
+external_mjpeg_url =  # If set (e.g., http://127.0.0.1:5001/stream.mjpg), controller will redirect to this stream

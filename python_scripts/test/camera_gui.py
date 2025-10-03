@@ -148,7 +148,7 @@ class CameraGUI(tk.Tk):
         self.btn_gain_apply = ttk.Button(self, text="Apply", command=lambda: self.on_gain_change(None, apply_click=True))
         self.btn_gain_apply.grid(row=2, column=3, padx=4)
 
-        # Resolution & FPS selectors
+        # Resolution, FPS & Downscale selectors
         ttk.Label(self, text="Resolution").grid(row=3, column=0, padx=4, sticky="e")
         self.common_resolutions = [
             "640x480", "800x600", "1024x768", "1280x720",
@@ -164,11 +164,16 @@ class CameraGUI(tk.Tk):
         self.fps_select = ttk.Combobox(self, textvariable=self.fps_var, values=self.common_fps, state="readonly", width=6)
         self.fps_select.grid(row=3, column=3, padx=4, sticky="ew")
 
+        ttk.Label(self, text="Downscale").grid(row=4, column=0, padx=4, sticky="e")
+        self.downscale_var = tk.StringVar(value="1")
+        self.downscale_select = ttk.Combobox(self, textvariable=self.downscale_var, values=["1","2","3","4"], state="readonly", width=6)
+        self.downscale_select.grid(row=4, column=1, padx=4, sticky="ew")
+
         self.btn_video_apply = ttk.Button(self, text="Apply Video Settings", command=self.apply_video_settings)
-        self.btn_video_apply.grid(row=4, column=0, columnspan=4, pady=(4,2), padx=4, sticky="ew")
+        self.btn_video_apply.grid(row=5, column=0, columnspan=4, pady=(4,2), padx=4, sticky="ew")
 
         self.status_var = tk.StringVar(value="Idle")
-        ttk.Label(self, textvariable=self.status_var).grid(row=5, column=0, columnspan=4, pady=6)
+        ttk.Label(self, textvariable=self.status_var).grid(row=6, column=0, columnspan=4, pady=6)
 
         for col in range(4):
             self.grid_columnconfigure(col, weight=1)
@@ -231,6 +236,9 @@ class CameraGUI(tk.Tk):
             # Convert BGR -> RGB for display
             if Image is not None:
                 try:
+                    # Apply downscale sampling if selected
+                    if hasattr(self.camera, 'downscale') and self.camera.downscale and self.camera.downscale > 1:
+                        frame = frame[::self.camera.downscale, ::self.camera.downscale]
                     frame_rgb = frame[:, :, ::-1]
                     img = Image.fromarray(frame_rgb)
                     # Optionally scale down if very large
@@ -270,7 +278,14 @@ class CameraGUI(tk.Tk):
         self.camera.width = new_w
         self.camera.height = new_h
         self.camera.fps = new_fps
-        self.status_var.set(f"Video settings applied: {new_w}x{new_h}@{new_fps}fps")
+        try:
+            ds_factor = int(getattr(self, 'downscale_var').get()) if hasattr(self, 'downscale_var') else 1
+            if ds_factor < 1:
+                ds_factor = 1
+        except Exception:
+            ds_factor = 1
+        self.camera.downscale = ds_factor
+        self.status_var.set(f"Video settings applied: {new_w}x{new_h}@{new_fps}fps (downscale {ds_factor}x)")
         if was_running:
             # restart stream automatically
             self.toggle_stream()

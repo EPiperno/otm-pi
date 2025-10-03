@@ -16,6 +16,7 @@ from __future__ import annotations
 import time, threading, configparser
 from pathlib import Path
 from typing import Optional
+import queue
 
 try:  # OpenCV is optional but preferred for generic USB/UVC cameras
     import cv2  # type: ignore
@@ -161,7 +162,7 @@ class OpenCVCameraThread(_BaseCameraThread):
 
 class DahengCameraThread(_BaseCameraThread):  # pragma: no cover - hardware dependent
     def __init__(self, index=1, serial: str | None = None, width=640, height=480,
-                 fps: int | None = None, jpeg_quality=80, flip_mode: str = 'none'):
+                 fps: int | None = None, jpeg_quality=80, flip_mode: str = 'none', safe_mode: bool = False):
         if gx is None:
             raise RuntimeError("gxipy (Daheng SDK) not installed but backend=daheng requested")
         self.index = index  # 1-based per Daheng API
@@ -171,6 +172,7 @@ class DahengCameraThread(_BaseCameraThread):  # pragma: no cover - hardware depe
         self.fps = fps
         self.jpeg_quality = int(jpeg_quality)
         self.flip_mode = flip_mode
+        self.safe_mode = safe_mode
         self.running = False
         self.thread = None
         self._lock = threading.Lock()
@@ -181,32 +183,75 @@ class DahengCameraThread(_BaseCameraThread):  # pragma: no cover - hardware depe
         self.cam = None
         self.last_frame_time: float | None = None
         self.frame_fail_count = 0
+    # Reliability helpers
+    self._cmd_q: queue.Queue[tuple[str, object | None]] = queue.Queue()
+    self._stop_evt = threading.Event()
+    self._consecutive_empty = 0
+    self.timeout_ms = 200
 
     def start(self):
         if self.running:
             return
+        self._stop_evt.clear()
         dm = gx.DeviceManager()
-        dev_num, dev_info_list = dm.update_device_list()
+        dev_num, _ = dm.update_device_list()
         if dev_num == 0:
             raise RuntimeError("No Daheng cameras found")
+        # Open by serial or index
         try:
             if self.serial:
                 self.cam = dm.open_device_by_sn(self.serial)
+                print(f"[camera] Opened Daheng camera by serial {self.serial}", flush=True)
             else:
                 self.cam = dm.open_device_by_index(int(self.index))
+                print(f"[camera] Opened Daheng camera index {self.index}", flush=True)
         except Exception as e:
             raise RuntimeError(f"Failed to open Daheng camera (serial={self.serial} index={self.index}): {e}")
-        # Stream on
+
+        # Optionally skip configuration in safe_mode to avoid driver crashes
+        if self.safe_mode:
+            print("[camera] Daheng safe_mode enabled: skipping width/height/fps configuration and auto feature toggles", flush=True)
+        else:
+            # Disable auto exposure/gain if available to allow manual control
+            try:
+                for attr, off_val in (("ExposureAuto", 0), ("GainAuto", 0)):
+                    if hasattr(self.cam, attr):
+                        getattr(self.cam, attr).set(off_val)
+                print("[camera] Disabled auto exposure/gain", flush=True)
+            except Exception as e:
+                print(f"[camera] Warning: failed to disable auto features: {e}", flush=True)
+            # Apply width/height/fps if supported by SDK
+            try:
+                if self.width and hasattr(self.cam, 'Width'):
+                    self.cam.Width.set(int(self.width))
+                    print(f"[camera] Set Width={self.width}", flush=True)
+                if self.height and hasattr(self.cam, 'Height'):
+                    self.cam.Height.set(int(self.height))
+                    print(f"[camera] Set Height={self.height}", flush=True)
+                if self.fps and all(hasattr(self.cam, a) for a in ('AcquisitionFrameRateEnable','AcquisitionFrameRate')):
+                    try:
+                        self.cam.AcquisitionFrameRateEnable.set(True)
+                        self.cam.AcquisitionFrameRate.set(float(self.fps))
+                        print(f"[camera] Set FPS={self.fps}", flush=True)
+                    except Exception as e:
+                        print(f"[camera] Warning: failed to set FPS: {e}", flush=True)
+            except Exception as e:
+                print(f"[camera] Warning: width/height/fps configuration error: {e}", flush=True)
+
+        # Start stream
         try:
             self.cam.stream_on()
+            print("[camera] Daheng stream_on successful", flush=True)
         except Exception as e:
             raise RuntimeError(f"Failed to start Daheng stream: {e}")
         self.running = True
+        # Always use a dedicated capture thread so all SDK access stays in one thread
         self.thread = threading.Thread(target=self._loop, daemon=True)
         self.thread.start()
 
     def stop(self):
         self.running = False
+        self._stop_evt.set()
         if self.cam:
             try:
                 self.cam.stream_off()
@@ -220,77 +265,140 @@ class DahengCameraThread(_BaseCameraThread):  # pragma: no cover - hardware depe
         self.thread = None
 
     def _loop(self):
-        # Daheng data_stream[0] typical, fallback if not
-        while self.running:
+        # Continuous acquisition loop for Daheng camera
+        while self.running and not self._stop_evt.is_set():
             try:
-                ds = self.cam.data_stream[0]
-                raw = ds.get_image(timeout=100)  # 100 ms
-                if raw is None:
-                    continue
-                try:
-                    rgb = raw.convert("RGB")
-                    frame = rgb.get_numpy_array()
-                except Exception:
-                    # Some SDK versions: raw.get_numpy_array() already returns BGR
-                    frame = raw.get_numpy_array()
-                if frame is None:
-                    continue
-                if self.flip_mode == 'h' and cv2 is not None:
-                    frame = cv2.flip(frame, 1)
-                elif self.flip_mode == 'v' and cv2 is not None:
-                    frame = cv2.flip(frame, 0)
-                elif self.flip_mode in ('hv','vh','both') and cv2 is not None:
-                    frame = cv2.flip(frame, -1)
-                if cv2 is None:
-                    # Cannot JPEG encode without OpenCV; skip
-                    continue
-                ret, buf = cv2.imencode('.jpg', frame, [int(cv2.IMWRITE_JPEG_QUALITY), self.jpeg_quality])
-                if ret:
-                    with self._lock:
-                        self._latest = buf.tobytes()
-                        self.last_frame_time = time.time()
-                        self.frame_fail_count = 0
+                self._apply_pending_commands()
+                self._capture_once()
             except Exception:
                 self.frame_fail_count += 1
                 time.sleep(0.05)
                 continue
+            # modest pacing to avoid busy loop; respect fps if provided
+            delay = 1.0 / (self.fps or 15)
+            time.sleep(delay)
+            # If capture appears stalled, try to restart stream
+            if self._consecutive_empty >= max(10, int((self.fps or 15) * 1.0)):
+                try:
+                    print("[camera] Daheng: no frames recently; restarting stream", flush=True)
+                    if self.cam:
+                        try:
+                            self.cam.stream_off()
+                            time.sleep(0.05)
+                        except Exception:
+                            pass
+                        self.cam.stream_on()
+                        self._consecutive_empty = 0
+                        time.sleep(0.1)
+                except Exception as e:
+                    print(f"[camera] Daheng: stream restart failed: {e}", flush=True)
+                    # escalate: close and reopen device
+                    try:
+                        dm = gx.DeviceManager()
+                        _ = dm.update_device_list()
+                        if self.serial:
+                            self.cam = dm.open_device_by_sn(self.serial)
+                        else:
+                            self.cam = dm.open_device_by_index(int(self.index))
+                        self.cam.stream_on()
+                        self._consecutive_empty = 0
+                    except Exception as e2:
+                        print(f"[camera] Daheng: device reopen failed: {e2}", flush=True)
+
+    def _capture_once(self):
+        ds = self.cam.data_stream[0]
+        raw = ds.get_image(timeout=self.timeout_ms)
+        if raw is None:
+            self._consecutive_empty += 1
+            return
+        try:
+            rgb = raw.convert("RGB")
+            frame = rgb.get_numpy_array()
+        except Exception:
+            frame = raw.get_numpy_array()
+        if frame is None:
+            return
+        if self.flip_mode == 'h' and cv2 is not None:
+            frame = cv2.flip(frame, 1)
+        elif self.flip_mode == 'v' and cv2 is not None:
+            frame = cv2.flip(frame, 0)
+        elif self.flip_mode in ('hv','vh','both') and cv2 is not None:
+            frame = cv2.flip(frame, -1)
+        if cv2 is None:
+            return
+        ret, buf = cv2.imencode('.jpg', frame, [int(cv2.IMWRITE_JPEG_QUALITY), self.jpeg_quality])
+        if ret:
+            with self._lock:
+                self._latest = buf.tobytes()
+                self.last_frame_time = time.time()
+                self.frame_fail_count = 0
+                self._consecutive_empty = 0
+
+    def _apply_pending_commands(self):
+        # Apply queued parameter updates in the capture thread (single-threaded SDK access)
+        while not self._cmd_q.empty():
+            try:
+                cmd, val = self._cmd_q.get_nowait()
+            except Exception:
+                break
+            try:
+                if cmd == 'set_exposure':
+                    v = float(val) if val is not None else None
+                    if v is not None:
+                        # Interpret small values as milliseconds for convenience
+                        v_us = v * 1000.0 if v < 100 else v
+                        if self.cam and hasattr(self.cam, 'ExposureTime'):
+                            self.cam.ExposureTime.set(float(v_us))
+                        self.exposure = v_us
+                elif cmd == 'set_gain':
+                    v = float(val) if val is not None else None
+                    if v is not None and self.cam and hasattr(self.cam, 'Gain'):
+                        self.cam.Gain.set(float(v))
+                        self.gain = v
+                elif cmd == 'set_format' and not self.safe_mode:
+                    w, h, f = val if isinstance(val, tuple) else (None, None, None)
+                    if self.cam:
+                        if w and hasattr(self.cam, 'Width'):
+                            self.cam.Width.set(int(w))
+                        if h and hasattr(self.cam, 'Height'):
+                            self.cam.Height.set(int(h))
+                        if f and all(hasattr(self.cam, a) for a in ('AcquisitionFrameRateEnable','AcquisitionFrameRate')):
+                            try:
+                                self.cam.AcquisitionFrameRateEnable.set(True)
+                                self.cam.AcquisitionFrameRate.set(float(f))
+                            except Exception:
+                                pass
+                        time.sleep(0.02)
+                # ignore unknown cmds
+            except Exception as e:
+                print(f"[camera] Daheng: command '{cmd}' failed: {e}", flush=True)
 
     def get_frame(self):
         with self._lock:
             return self._latest
 
     def reconfigure(self, width=None, height=None, fps=None):
-        # Minimal: restart stream if size/fps would change; many Daheng params require stop/start
-        do_restart = width or height or fps
-        if do_restart and self.running:
-            self.stop()
+        # Queue format changes to be applied in capture thread to avoid cross-thread SDK calls
         if width: self.width = width
         if height: self.height = height
         if fps: self.fps = fps
-        if do_restart:
-            self.start()
+        try:
+            self._cmd_q.put(('set_format', (self.width, self.height, self.fps)))
+        except Exception:
+            pass
 
     def set_exposure(self, value):
-        self.exposure = value
-        if self.cam and value is not None:
-            for attr in ("ExposureTime", "ExposureTimeRaw"):
-                try:
-                    node = getattr(self.cam, attr)
-                    node.set(float(value))
-                    break
-                except Exception:
-                    continue
+        # Queue to capture thread
+        try:
+            self._cmd_q.put(('set_exposure', value))
+        except Exception:
+            pass
 
     def set_gain(self, value):
-        self.gain = value
-        if self.cam and value is not None:
-            for attr in ("Gain", "GainRaw"):
-                try:
-                    node = getattr(self.cam, attr)
-                    node.set(float(value))
-                    break
-                except Exception:
-                    continue
+        try:
+            self._cmd_q.put(('set_gain', value))
+        except Exception:
+            pass
 
     def get_status(self) -> dict:
         return {
@@ -305,7 +413,10 @@ class DahengCameraThread(_BaseCameraThread):  # pragma: no cover - hardware depe
             'last_frame_age_s': (time.time() - self.last_frame_time) if self.last_frame_time else None,
             'frame_fail_count': self.frame_fail_count,
             'exposure': self.exposure,
-            'gain': self.gain
+            'gain': self.gain,
+            'safe_mode': self.safe_mode,
+            'consecutive_empty': self._consecutive_empty,
+            'timeout_ms': self.timeout_ms
         }
 
 
@@ -370,17 +481,23 @@ def create_camera_from_config(cfg: Optional[configparser.ConfigParser] = None):
         cam = OpenCVCameraThread(device=dev_obj, width=w, height=h, fps=fps,
                                  jpeg_quality=jq_val, flip_mode=flip)
     elif backend == 'daheng':
+        # Optional safe_mode (skip width/height/fps config to avoid crashes)
+        safe_mode_raw = (sec.get('safe_mode') or '').split('#',1)[0].strip().lower()
+        safe_mode = safe_mode_raw in ('1','true','yes','on')
         cam = DahengCameraThread(index=index, serial=serial, width=w, height=h,
-                                 fps=fps, jpeg_quality=jq_val, flip_mode=flip)
+                                 fps=fps, jpeg_quality=jq_val, flip_mode=flip, safe_mode=safe_mode)
     else:
         raise RuntimeError(f"Unknown camera backend '{backend}' (expected opencv or daheng)")
 
-    # Start camera with fallback logic for OpenCV backend (scan other indices if first fails)
+    # Start camera with fallback logic:
+    # 1. If backend=opencv: scan alternative /dev/video indices on failure.
+    # 2. If backend=daheng fails entirely: attempt automatic OpenCV fallback scan.
     try:
         cam.start()
     except Exception as e:
-        if isinstance(cam, OpenCVCameraThread) and isinstance(cam.device, int):
+        if backend == 'opencv' and isinstance(cam, OpenCVCameraThread) and isinstance(cam.device, int):
             original_err = str(e)
+            print(f"[camera] OpenCV start failed on device {cam.device}: {original_err}; scanning other indices 0-5")
             for alt in range(0, 6):  # try /dev/video0-5
                 if alt == cam.device:
                     continue
@@ -388,12 +505,31 @@ def create_camera_from_config(cfg: Optional[configparser.ConfigParser] = None):
                     alt_cam = OpenCVCameraThread(device=alt, width=w, height=h, fps=fps,
                                                  jpeg_quality=jq_val, flip_mode=flip)
                     alt_cam.start()
+                    print(f"[camera] OpenCV fallback succeeded on /dev/video{alt}")
                     cam = alt_cam
                     break
                 except Exception:
                     continue
             else:
                 raise RuntimeError(f"Failed to start OpenCV camera (initial device {cam.device}): {original_err}")
+        elif backend == 'daheng':
+            dh_err = str(e)
+            print(f"[camera] Daheng backend failed to start: {dh_err}. Attempting OpenCV fallback scan 0-5.")
+            last_err = dh_err
+            for alt in range(0, 6):
+                try:
+                    alt_cam = OpenCVCameraThread(device=alt, width=w, height=h, fps=fps,
+                                                 jpeg_quality=jq_val, flip_mode=flip)
+                    alt_cam.start()
+                    print(f"[camera] Fallback to OpenCV succeeded on /dev/video{alt}")
+                    cam = alt_cam
+                    backend = 'opencv'
+                    break
+                except Exception as oe:
+                    last_err = str(oe)
+                    continue
+            else:
+                raise RuntimeError(f"Failed to start Daheng camera and OpenCV fallback: Daheng error: {dh_err}; last OpenCV error: {last_err}")
         else:
             raise
 

@@ -27,6 +27,8 @@ from flask import Flask, Response, request, jsonify, render_template_string
 
 # Import camera abstraction & generator
 from camera_feed import create_camera_from_config, mjpeg_frame_generator
+import configparser
+from pathlib import Path
 
 # Import motor utilities
 from run_stepper import (
@@ -125,8 +127,18 @@ async function releaseAll(e){ e.preventDefault(); const r=await fetch('/motor/re
 def create_app() -> Flask:
     app = Flask(__name__)
 
-    # Initialize camera & motors (singletons for process)
-    camera = create_camera_from_config()
+    # Read config for optional external MJPEG URL to avoid SDK crashes
+    cfg = configparser.ConfigParser()
+    cfg_path = Path(__file__).parent / 'config.txt'
+    if cfg_path.exists():
+        cfg.read(cfg_path)
+    cam_cfg = cfg['camera'] if 'camera' in cfg else {}
+    external_mjpeg_url = cam_cfg.get('external_mjpeg_url', '').split('#',1)[0].strip() if cam_cfg else ''
+
+    # Initialize camera & motors (singletons for process) unless using external stream
+    camera = None
+    if not external_mjpeg_url:
+        camera = create_camera_from_config()
     kit = init_motors()
 
     # ---------------- Camera Routes ----------------
@@ -136,11 +148,18 @@ def create_app() -> Flask:
 
     @app.route('/stream.mjpg')
     def stream():
+        if external_mjpeg_url:
+            # Redirect browser directly to external MJPEG stream (e.g., camera_web.py on :5001)
+            from flask import redirect
+            return redirect(external_mjpeg_url, code=302)
+        assert camera is not None, "Internal camera not initialized"
         return Response(mjpeg_frame_generator(camera), mimetype='multipart/x-mixed-replace; boundary=frame')
 
     @app.route('/camera/status')
     def camera_status():
         status = {}
+        if external_mjpeg_url:
+            return jsonify({'external': True, 'url': external_mjpeg_url})
         try:
             if hasattr(camera, 'get_status'):
                 status = camera.get_status()
@@ -157,6 +176,11 @@ def create_app() -> Flask:
 
     @app.route('/camera/settings', methods=['GET', 'POST'])
     def camera_settings():
+        if external_mjpeg_url:
+            # No-op when using external stream
+            if request.method == 'POST':
+                return jsonify({'message': 'External stream in use; settings not applied', 'external': True})
+            return jsonify({'external': True})
         if request.method == 'POST':
             data = request.get_json(silent=True) or request.form
             resp = {}
@@ -180,6 +204,10 @@ def create_app() -> Flask:
 
     @app.route('/camera/video', methods=['GET', 'POST'])
     def camera_video():
+        if external_mjpeg_url:
+            if request.method == 'POST':
+                return jsonify({'message': 'External stream in use; video settings not applied', 'external': True})
+            return jsonify({'external': True, 'resolution': None, 'fps': None, 'flip_mode': None})
         if request.method == 'POST':
             data = request.get_json(silent=True) or {}
             res = data.get('resolution')

@@ -24,10 +24,24 @@ from typing import Literal, Optional
 try:
 	from adafruit_motorkit import MotorKit  # type: ignore
 	from adafruit_motor import stepper  # type: ignore
-except ImportError as e:  # pragma: no cover - hardware import
-	raise RuntimeError(
-		"Adafruit MotorKit libraries not found. Install with 'pip install adafruit-circuitpython-motorkit'"
-	) from e
+except ImportError:  # pragma: no cover - provide graceful fallback
+	class _DummyStepper:
+		def onestep(self, *_, **__):
+			pass
+		def release(self):
+			pass
+
+	class MotorKit:  # type: ignore
+		def __init__(self, *_, **__):
+			self.stepper1 = _DummyStepper()
+			self.stepper2 = _DummyStepper()
+
+	class _DummyStepperConst:
+		SINGLE=1; DOUBLE=2; INTERLEAVE=3; MICROSTEP=4
+		FORWARD=1; BACKWARD=2
+
+	stepper = _DummyStepperConst()  # type: ignore
+	print("[run_stepper] Warning: Adafruit MotorKit libraries not installed; using no-op dummy motors.")
 
 StepperID = Literal['Z', 'THETA']
 StepStyle = Literal['SINGLE', 'DOUBLE', 'INTERLEAVE', 'MICROSTEP']
